@@ -2,9 +2,14 @@ import { animate, stagger } from 'motion';
 import { apiService } from './services/api';
 import { router } from './router';
 
-const WS_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:8001')
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8001';
+const WS_BASE = API_BASE
   .replace(/^https/, 'wss')
   .replace(/^http/, 'ws');
+
+// Serverless hosts (Vercel) can't hold WebSockets open, so there chat streams
+// each reply over SSE from POST /api/chat/sessions/{id}/message instead.
+const USE_SSE = import.meta.env.VITE_CHAT_TRANSPORT === 'sse';
 
 export const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -94,6 +99,7 @@ function removeWorkflowSession(workflowId: string, sessionId: number): void {
 
 class ChatManager {
   private ws: WebSocket | null = null;
+  private sseAbort: AbortController | null = null;
   private activeSessionId: number | null = null;
   private isStreaming = false;
   private pendingBubble: HTMLElement | null = null;
@@ -316,7 +322,15 @@ class ChatManager {
     const token = localStorage.getItem('auth_token');
     if (!token) { router.navigate('/login'); return; }
 
-    const url = `${WS_BASE}/api/chat/ws/${sessionId}?token=${encodeURIComponent(token)}`;
+    if (USE_SSE) {
+      // Nothing to hold open — each send() is its own streaming request.
+      this._setStatus('Connected', false);
+      const sendBtn = this._elByName('chatSendBtn') as HTMLButtonElement | null;
+      if (sendBtn) sendBtn.disabled = false;
+      return;
+    }
+
+    const url =`${WS_BASE}/api/chat/ws/${sessionId}?token=${encodeURIComponent(token)}`;
     this.ws = new WebSocket(url);
 
     this.ws.onopen = () => {
@@ -363,6 +377,8 @@ class ChatManager {
       this.loadSessions();
 
     } else if (msg.type === 'error') {
+      this.editTypingIndicator?.remove();
+      this.editTypingIndicator = null;
       this._setStatus(`Error: ${msg.detail}`, true);
       this.isStreaming = false;
       this.pendingBubble = null;
@@ -383,6 +399,8 @@ class ChatManager {
   private closeWS(): void {
     this.ws?.close();
     this.ws = null;
+    this.sseAbort?.abort();
+    this.sseAbort = null;
     this.pendingBubble = null;
     this.isStreaming = false;
     this.editTypingIndicator?.remove();
@@ -392,8 +410,80 @@ class ChatManager {
 
   // ── Send ──────────────────────────────────────────────────────────────────────
 
+  private _canSend(): boolean {
+    if (USE_SSE) return this.activeSessionId !== null;
+    return !!this.ws && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  private _transmit(payload: Record<string, unknown>): void {
+    if (USE_SSE) { void this._postSSE(payload); return; }
+    this.ws?.send(JSON.stringify(payload));
+  }
+
+  // Streams one reply over SSE, feeding each `data:` event to handleMsg exactly
+  // like a WebSocket frame. fetch() is used instead of EventSource because
+  // EventSource can't POST or send an Authorization header.
+  private async _postSSE(payload: Record<string, unknown>): Promise<void> {
+    const sessionId = this.activeSessionId;
+    const token = localStorage.getItem('auth_token');
+    if (!sessionId || !token) { router.navigate('/login'); return; }
+
+    const abort = new AbortController();
+    this.sseAbort = abort;
+
+    try {
+      const res = await fetch(`${API_BASE}/api/chat/sessions/${sessionId}/message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        credentials: 'include',
+        signal: abort.signal,
+        body: JSON.stringify({
+          llm_provider: this.activeSession?.llm_provider,
+          llm_model:    this.activeSession?.llm_model ?? undefined,
+          ...payload,
+        }),
+      });
+
+      if (!res.ok || !res.body) {
+        const err = await res.json().catch(() => ({}));
+        const detail = res.status === 401 ? 'Auth error — please log in again'
+                     : typeof err.detail === 'string' ? err.detail
+                     : `HTTP ${res.status}`;
+        this.handleMsg({ type: 'error', detail });
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let sep: number;
+        while ((sep = buf.indexOf('\n\n')) !== -1) {
+          const frame = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          for (const line of frame.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            try { this.handleMsg(JSON.parse(line.slice(5).trim())); } catch { /* malformed */ }
+          }
+        }
+      }
+
+      // Stream closed without a terminal event — unlock the input.
+      if (this.isStreaming && this.sseAbort === abort) {
+        this.handleMsg({ type: 'error', detail: 'Response ended unexpectedly' });
+      }
+    } catch {
+      if (!abort.signal.aborted) this.handleMsg({ type: 'error', detail: 'Connection error' });
+    } finally {
+      if (this.sseAbort === abort) this.sseAbort = null;
+    }
+  }
+
   send(text: string): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.isStreaming || !text.trim()) return;
+    if (!this._canSend() || this.isStreaming || !text.trim()) return;
     this._appendBubble('user', text);
     const box = this._elByName('chatMessages');
     if (box) box.scrollTop = box.scrollHeight;
@@ -407,15 +497,15 @@ class ChatManager {
       this._startTypingAnimation();
     }
 
-    this.ws.send(JSON.stringify({
+    this._transmit({
       message: text,
       llm_provider: this.activeSession?.llm_provider,
       llm_model:    this.activeSession?.llm_model ?? undefined,
-    }));
+    });
   }
 
   sendEdit(text: string, canvasState: any): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.isStreaming) return;
+    if (!this._canSend() || this.isStreaming) return;
     this.isStreaming = true;
     const sendBtn = this._elByName('chatSendBtn') as HTMLButtonElement | null;
     if (sendBtn) sendBtn.disabled = true;
@@ -432,11 +522,11 @@ class ChatManager {
       this.editTypingIndicator = ind;
     }
 
-    this.ws.send(JSON.stringify({
+    this._transmit({
       message:      text,
       edit_mode:    true,
       canvas_state: canvasState,
-    }));
+    });
   }
 
 
